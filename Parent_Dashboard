@@ -1,0 +1,922 @@
+import customtkinter as ctk
+import tkinter as tk
+from tkinter import ttk, messagebox
+import pickle
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad, unpad
+import threading
+import time
+from tcp_by_size import recv_by_size, send_with_size
+import sys
+import socket
+from Crypto.Random import get_random_bytes
+
+global key
+
+
+class ParentDashboard(ctk.CTk):
+    def __init__(self, sock, username, key_srv):
+        global key
+        super().__init__()
+        self.sock = sock
+        self.username = username
+        key = key_srv
+        self.stop_listening = False
+        self.pause_listening = False
+
+        # Basic window setup + closing protocol
+        ctk.set_appearance_mode('dark')
+        ctk.set_default_color_theme('blue')
+        self.protocol("WM_DELETE_WINDOW", self.on_closing)
+        self.geometry('800x600')
+        self.title("Parent Dashboard")
+
+        # Create a tab control
+        self.tabview = ctk.CTkTabview(self)
+        self.tabview.pack(padx=20, pady=20, fill="both", expand=True)
+
+        # Create tabs
+        self.tab_overview = self.tabview.add("Overview")
+        self.tab_apps = self.tabview.add("Applications")
+        self.tab_websites = self.tabview.add("Websites")
+        self.tab_time = self.tabview.add("Screen Time")
+        self.tab_settings = self.tabview.add("Settings")
+
+        # Initialize data dictionaries for children
+        self.children_dict = {}
+        self.children_names = []
+        self.child_time_data = {}
+        self.blocked_apps_widgets = []
+        self.blocked_websites_widgets = []
+
+        # Set up each tab's content
+        self.setup_overview_tab()
+        self.setup_apps_tab()
+        self.setup_websites_tab()
+        self.setup_time_tab()
+        self.setup_settings_tab()
+
+        # Start notification checker thread
+        self.listening_thread = threading.Thread(target=self.listen_to_server)
+        self.listening_thread.daemon = True
+        self.listening_thread.start()
+
+    def send_direct_request(self, request_dict):
+        """שולח בקשה ישירה לשרת וממתין לתשובה, תוך השהיית תרד ההאזנה"""
+        try:
+            # השהה את תרד ההאזנה
+            self.pause_listening = True
+            time.sleep(0.2)  # המתן שהתרד יפסיק להאזין
+
+            # שלח את הבקשה
+            data = pickle.dumps(request_dict)
+            data = self.AESenc(data)
+            send_with_size(self.sock, data)
+
+            # קבל את התשובה ישירות
+            data = recv_by_size(self.sock, return_type='byte')
+            response_data = self.AESdec(data)
+            response = pickle.loads(response_data)
+
+            # החזר את תרד ההאזנה לפעולה
+            self.pause_listening = False
+
+            return response
+        except Exception as e:
+            print(f"Error in direct request: {e}")
+            # ודא שתרד ההאזנה מופעל מחדש גם במקרה של שגיאה
+            self.pause_listening = False
+            return None
+
+    def listen_to_server(self):
+        """Listen for messages from the server"""
+        while not self.stop_listening:
+            try:
+                # אם ההאזנה מושהית זמנית, המתן קצת ונסה שוב
+                if self.pause_listening:
+                    time.sleep(0.1)
+                    continue
+
+                encrypted_data = recv_by_size(self.sock, return_type='byte')
+                decrypted_data = self.AESdec(encrypted_data)
+                message = pickle.loads(decrypted_data)
+
+                self.handle_server_message(message)
+            except Exception as e:
+                print(f"Error receiving message from server: {e}")
+                if not self.stop_listening:
+                    continue
+
+    def show_connection_error(self):
+        """Show connection error dialog and exit"""
+        messagebox.showerror("Connection Lost",
+                             "Connection to the server has been lost. The application will now close.")
+        self.on_closing()
+
+    def handle_server_message(self, message):
+        """Process messages received from the server"""
+        message_type = message.get('code', '')
+        print(f"Received message type: {message_type}")
+
+        if message_type == 'notification':
+            # Show notification to user
+            content = message.get('content', '')
+            self.after(0, lambda c=content: self.show_notification(c))
+            self.after(0, lambda c=content: self.add_activity_to_list(c))
+
+        elif message_type == 'update_apps':
+            self.after(0, lambda: self.update_blocked_apps_list(message.get('apps', [])))
+
+        elif message_type == 'update_children_status':
+            self.after(0, lambda: self.update_children_status(message.get('children', [])))
+
+        elif message_type == 'children_status_update':
+            self.after(0, lambda: self.process_children_status_update(message.get('children', [])))
+
+    def process_children_status_update(self, children_data):
+        """Process the children status update from server"""
+        if not children_data:
+            return
+
+        # Update the child_time_data dictionary with current values
+        for child in children_data:
+            username = child["username"]
+            is_connected = child.get("connected", False)
+
+            if "used_time" in child and "time_limit" in child:
+                used_time = child["used_time"]  # in minutes
+                time_limit = child["time_limit"]  # in minutes
+
+                # Convert minutes to hours and minutes for display
+                used_hours = int(used_time // 60)
+                used_minutes = int(used_time % 60)
+                limit_hours = int(time_limit // 60)
+                limit_minutes = int(time_limit % 60)
+
+                # Update the data store
+                if username in self.child_time_data:
+                    self.child_time_data[username].update({
+                        "used_hours": used_hours,
+                        "used_minutes": used_minutes,
+                        "limit_hours": limit_hours,
+                        "limit_minutes": limit_minutes,
+                        "connected": is_connected
+                    })
+                else:
+                    self.child_time_data[username] = {
+                        "used_hours": used_hours,
+                        "used_minutes": used_minutes,
+                        "limit_hours": limit_hours,
+                        "limit_minutes": limit_minutes,
+                        "connected": is_connected
+                    }
+
+            # Make sure we have the child in our names list
+            if username not in self.children_names:
+                self.children_names.append(username)
+                # Update the child selection dropdown if it exists
+                if hasattr(self, 'child_dropdown') and self.child_dropdown:
+                    self.child_dropdown.configure(values=self.children_names)
+
+        # If the current child is in the update, refresh the display
+        if hasattr(self, 'current_child') and self.current_child in self.child_time_data:
+            self.update_time_display()
+
+        # Also update the overview tab with connection status
+        self.update_children_status_display(children_data)
+
+    def update_children_status_display(self, children_data):
+        """Update the children status display in the overview tab"""
+        # Find the status frame in the overview tab
+        for widget in self.tab_overview.winfo_children():
+            if isinstance(widget, ctk.CTkFrame):
+                # Look for the status frame - it has the "Children Status" label
+                for child_widget in widget.winfo_children():
+                    if isinstance(child_widget, ctk.CTkLabel) and "Children Status" in child_widget.cget("text"):
+                        # This is the status frame - clear existing children
+                        for label in widget.winfo_children():
+                            if isinstance(label, ctk.CTkLabel) and "•" in label.cget("text"):
+                                label.destroy()
+
+                        # Add updated status
+                        for child_data in children_data:
+                            username = child_data.get("username", "Unknown")
+                            status = "Connected" if child_data.get("connected", False) else "Disconnected"
+
+                            status_text = f"{username} - {status}"
+
+                            # Add time info if available
+                            if "used_time" in child_data and "time_limit" in child_data:
+                                used_time = child_data["used_time"]
+                                time_limit = child_data["time_limit"]
+                                percentage = min(100, int((used_time / time_limit) * 100)) if time_limit > 0 else 0
+                                status_text += f" - Time: {int(used_time)} min / {int(time_limit)} min ({percentage}%)"
+
+                            # Create and pack the label
+                            child_label = ctk.CTkLabel(widget, text=f"• {status_text}")
+                            child_label.pack(anchor="w", padx=30, pady=2)
+
+                        return
+
+    def on_closing(self):
+        """Handle window close event"""
+        # Set the flag to stop listening thread
+        self.stop_listening = True
+
+        # Send exit request to server
+        self.exitReq()
+
+        # Close the window
+        self.quit()
+        self.destroy()
+        sys.exit()
+
+    def AESenc(self, data, k=None):
+        """Encrypt data using AES"""
+        if k is None:
+            k = key
+        iv = get_random_bytes(AES.block_size)  # Generate a random IV
+        cipher = AES.new(k, AES.MODE_CBC, iv=iv)
+        ciphertext = cipher.encrypt(pad(data, AES.block_size))
+        return iv + ciphertext  # Prepend IV to the ciphertext for later use in decryption
+
+    def AESdec(self, data, k=None):
+        """Decrypt data using AES"""
+        if k is None:
+            k = key
+        iv = data[:AES.block_size]  # Extract IV from the beginning of the ciphertext
+        cipher = AES.new(k, AES.MODE_CBC, iv=iv)
+        decrypted = unpad(cipher.decrypt(data[AES.block_size:]), AES.block_size)
+        return decrypted
+
+    def exitReq(self):
+        """Send exit request to server"""
+        try:
+            global key
+            login_dict = {
+                "code": 'exit',
+            }
+            data = pickle.dumps(login_dict)
+            data = self.AESenc(data, key)
+            send_with_size(self.sock, data)
+        except Exception as e:
+            print(f"Error sending exit request: {e}")
+
+    def update_blocked_apps_list(self, apps_list):
+        """Update the blocked applications list with data from server"""
+        # Clear existing apps
+        for widget in self.blocked_apps_widgets:
+            widget["frame"].destroy()
+
+        self.blocked_apps_widgets = []
+
+        # Add new apps from the server
+        for app in apps_list:
+            self.add_app_to_list(app)
+
+        messagebox.showinfo("Update", "Blocked applications list has been updated")
+
+    def add_activity_to_list(self, activity_text):
+        """Add an activity notification to the overview tab"""
+        # Find the activity frame in the overview tab
+        for widget in self.tab_overview.winfo_children():
+            if isinstance(widget, ctk.CTkFrame):
+                # Look for the activity frame - it has the "Recent Activity" label
+                for child in widget.winfo_children():
+                    if isinstance(child, ctk.CTkLabel) and "Recent Activity" in child.cget("text"):
+                        # This is the activity frame
+                        activity_label = ctk.CTkLabel(widget, text=f"• {activity_text}")
+                        activity_label.pack(anchor="w", padx=30, pady=2)
+                        return
+
+    def setup_overview_tab(self):
+        """Set up the Overview tab"""
+        # Header
+        header = ctk.CTkLabel(self.tab_overview, text=f"Welcome, {self.username}!", font=("Helvetica", 20))
+        header.pack(pady=(20, 10))
+
+        # Status frame
+        status_frame = ctk.CTkFrame(self.tab_overview)
+        status_frame.pack(padx=20, pady=10, fill="x")
+
+        # Child status section
+        child_status = ctk.CTkLabel(status_frame, text="Children Status:", font=("Helvetica", 16))
+        child_status.pack(anchor="w", padx=10, pady=(10, 5))
+
+        # Get initial children data
+        self.get_initial_children_data()
+
+        # Activity summary
+        activity_frame = ctk.CTkFrame(self.tab_overview)
+        activity_frame.pack(padx=20, pady=10, fill="x")
+
+        activity_header = ctk.CTkLabel(activity_frame, text="Recent Activity Summary:", font=("Helvetica", 16))
+        activity_header.pack(anchor="w", padx=10, pady=(10, 5))
+
+        # Quick actions
+        actions_frame = ctk.CTkFrame(self.tab_overview)
+        actions_frame.pack(padx=20, pady=10, fill="x")
+
+        actions_header = ctk.CTkLabel(actions_frame, text="Quick Actions:", font=("Helvetica", 16))
+        actions_header.pack(anchor="w", padx=10, pady=(10, 5))
+
+        button_frame = ctk.CTkFrame(actions_frame, fg_color="transparent")
+        button_frame.pack(padx=20, pady=10, fill="x")
+
+        block_all_btn = ctk.CTkButton(button_frame, text="Block All Devices", command=self.block_all_devices)
+        block_all_btn.pack(side="left", padx=10)
+
+        extend_time_btn = ctk.CTkButton(button_frame, text="Add Screen Time", command=self.extend_screen_time)
+        extend_time_btn.pack(side="left", padx=10)
+
+    def get_initial_children_data(self):
+        """Get initial data about children"""
+        try:
+            # Request children list from server
+            request = {
+                "code": "get_children_list",
+                "user": self.username
+            }
+            answer_dict = self.send_direct_request(request)
+            self.process_children_status_update(answer_dict['children'])
+
+            # Response will be handled by the listening thread
+        except Exception as e:
+            print(f"Error requesting children data: {e}")
+
+    def setup_apps_tab(self):
+        """Set up the Applications tab"""
+        apps_frame = ctk.CTkFrame(self.tab_apps)
+        apps_frame.pack(padx=20, pady=20, fill="both", expand=True)
+
+        # Header
+        header = ctk.CTkLabel(apps_frame, text="Application Management", font=("Helvetica", 18))
+        header.pack(pady=(10, 20))
+
+        # Add app section
+        add_frame = ctk.CTkFrame(apps_frame)
+        add_frame.pack(padx=20, pady=10, fill="x")
+
+        app_label = ctk.CTkLabel(add_frame, text="Application Name:")
+        app_label.pack(side="left", padx=10)
+
+        self.app_entry = ctk.CTkEntry(add_frame, placeholder_text="Example: chrome.exe")
+        self.app_entry.pack(side="left", padx=10, fill="x", expand=True)
+
+        add_btn = ctk.CTkButton(add_frame, text="Add to Blocked List", command=self.add_blocked_app)
+        add_btn.pack(side="left", padx=10)
+
+        # Blocked apps list
+        list_frame = ctk.CTkFrame(apps_frame)
+        list_frame.pack(padx=20, pady=(20, 10), fill="both", expand=True)
+
+        list_label = ctk.CTkLabel(list_frame, text="Blocked Applications:", font=("Helvetica", 16))
+        list_label.pack(anchor="w", padx=10, pady=(10, 5))
+
+        # Create a frame for the list
+        self.apps_list_frame = ctk.CTkScrollableFrame(list_frame)
+        self.apps_list_frame.pack(padx=10, pady=10, fill="both", expand=True)
+
+        # Request app list from server
+        self.get_app_names()
+
+    def setup_websites_tab(self):
+        """Set up the Websites tab"""
+        websites_frame = ctk.CTkFrame(self.tab_websites)
+        websites_frame.pack(padx=20, pady=20, fill="both", expand=True)
+
+        # Header
+        header = ctk.CTkLabel(websites_frame, text="Website Management", font=("Helvetica", 18))
+        header.pack(pady=(10, 20))
+
+        # Add website section
+        add_frame = ctk.CTkFrame(websites_frame)
+        add_frame.pack(padx=20, pady=10, fill="x")
+
+        website_label = ctk.CTkLabel(add_frame, text="Website URL:")
+        website_label.pack(side="left", padx=10)
+
+        self.website_entry = ctk.CTkEntry(add_frame, placeholder_text="Example: facebook.com")
+        self.website_entry.pack(side="left", padx=10, fill="x", expand=True)
+
+        add_btn = ctk.CTkButton(add_frame, text="Add to Blocked List", command=self.add_blocked_domain)
+        add_btn.pack(side="left", padx=10)
+
+        # Blocked websites list
+        list_frame = ctk.CTkFrame(websites_frame)
+        list_frame.pack(padx=20, pady=(20, 10), fill="both", expand=True)
+
+        list_label = ctk.CTkLabel(list_frame, text="Blocked Websites:", font=("Helvetica", 16))
+        list_label.pack(anchor="w", padx=10, pady=(10, 5))
+
+        # Create a frame for the list
+        self.websites_list_frame = ctk.CTkScrollableFrame(list_frame)
+        self.websites_list_frame.pack(padx=10, pady=10, fill="both", expand=True)
+
+        # Populate the website list
+        self.blocked_websites_widgets = []
+        self.get_domain_names()
+
+    def setup_time_tab(self):
+        """Set up the Screen Time tab"""
+        time_frame = ctk.CTkFrame(self.tab_time)
+        time_frame.pack(padx=20, pady=20, fill="both", expand=True)
+
+        # Initialize data
+        self.child_time_data = {}
+
+        # Default placeholder child
+        self.current_child = self.children_names[0] if self.children_names else "No children"
+
+        # Header
+        header = ctk.CTkLabel(time_frame, text="Screen Time Limits", font=("Helvetica", 18))
+        header.pack(pady=(10, 20))
+
+        # Child selection
+        child_frame = ctk.CTkFrame(time_frame, fg_color="transparent")
+        child_frame.pack(padx=20, pady=10, fill="x")
+
+        child_label = ctk.CTkLabel(child_frame, text="Select Child:")
+        child_label.pack(side="left", padx=10)
+
+        # OptionMenu with direct command
+        self.child_dropdown = ctk.CTkOptionMenu(
+            child_frame,
+            values=self.children_names if self.children_names else ["No children"],
+            command=self.on_child_select
+        )
+        if self.children_names:
+            self.child_dropdown.set(self.children_names[0])
+        else:
+            self.child_dropdown.set("No children")
+        self.child_dropdown.pack(side="left", padx=10)
+
+        # Time limit setting
+        time_limit_frame = ctk.CTkFrame(time_frame, fg_color="transparent")
+        time_limit_frame.pack(padx=20, pady=10, fill="x")
+
+        time_label = ctk.CTkLabel(time_limit_frame, text="Set Daily Screen Time Limit:")
+        time_label.pack(side="left", padx=10)
+
+        # Direct entry widgets
+        self.hours_entry = ctk.CTkEntry(time_limit_frame, width=60)
+        self.hours_entry.insert(0, "2")  # Default
+        self.hours_entry.pack(side="left", padx=5)
+
+        hours_label = ctk.CTkLabel(time_limit_frame, text="hours")
+        hours_label.pack(side="left", padx=5)
+
+        self.minutes_entry = ctk.CTkEntry(time_limit_frame, width=60)
+        self.minutes_entry.insert(0, "30")  # Default
+        self.minutes_entry.pack(side="left", padx=5)
+
+        minutes_label = ctk.CTkLabel(time_limit_frame, text="minutes")
+        minutes_label.pack(side="left", padx=5)
+
+        set_btn = ctk.CTkButton(time_limit_frame, text="Set", command=self.set_time_limit)
+        set_btn.pack(side="left", padx=20)
+
+        # Simple progress visualization section
+        viz_frame = ctk.CTkFrame(time_frame)
+        viz_frame.pack(padx=20, pady=20, fill="x")
+
+        # Time limit display
+        self.limit_display = ctk.CTkLabel(
+            viz_frame,
+            text=f"Daily Time Limit: 2h 30m",
+            font=("Helvetica", 16, "bold")
+        )
+        self.limit_display.pack(pady=(10, 5))
+
+        # Progress bar
+        self.progress_bar = ctk.CTkProgressBar(viz_frame, height=20)
+        self.progress_bar.pack(fill="x", padx=20, pady=10)
+        self.progress_bar.set(0)  # Default value
+
+        # Usage statistics
+        stats_frame = ctk.CTkFrame(viz_frame, fg_color="transparent")
+        stats_frame.pack(fill="x", padx=20, pady=5)
+
+        self.used_label = ctk.CTkLabel(
+            stats_frame,
+            text=f"Used: 0h 0m"
+        )
+        self.used_label.pack(side="left")
+
+        self.remaining_label = ctk.CTkLabel(
+            stats_frame,
+            text=f"Remaining: 2h 30m"
+        )
+        self.remaining_label.pack(side="right")
+
+    def setup_settings_tab(self):
+        """Set up the Settings tab"""
+        settings_frame = ctk.CTkFrame(self.tab_settings)
+        settings_frame.pack(padx=20, pady=20, fill="both", expand=True)
+
+        # Header
+        header = ctk.CTkLabel(settings_frame, text="General settings", font=("Helvetica", 18))
+        header.pack(pady=(10, 20))
+
+        # Notification settings
+        notif_frame = ctk.CTkFrame(settings_frame)
+        notif_frame.pack(padx=20, pady=10, fill="x")
+
+        notif_label = ctk.CTkLabel(notif_frame, text="Alerts settings:", font=("Helvetica", 16))
+        notif_label.pack(anchor="w", padx=10, pady=(10, 5))
+
+        self.notify_attempted_sites = ctk.CTkCheckBox(notif_frame,
+                                                      text="Alerts for trying to reach blocked applications")
+        self.notify_attempted_sites.pack(anchor="w", padx=30, pady=5)
+        self.notify_attempted_sites.select()
+
+        self.notify_app_attempts = ctk.CTkCheckBox(notif_frame, text="Alerts for trying to reach a blocked websites")
+        self.notify_app_attempts.pack(anchor="w", padx=30, pady=5)
+        self.notify_app_attempts.select()
+
+        self.notify_time_limit = ctk.CTkCheckBox(notif_frame, text="Alerts for reaching time limit")
+        self.notify_time_limit.pack(anchor="w", padx=30, pady=5)
+        self.notify_time_limit.select()
+
+        # Child account management
+        child_frame = ctk.CTkFrame(settings_frame)
+        child_frame.pack(padx=20, pady=(20, 10), fill="x")
+
+        child_label = ctk.CTkLabel(child_frame, text="Manage kid accounts:", font=("Helvetica", 16))
+        child_label.pack(anchor="w", padx=10, pady=(10, 5))
+
+        add_child_btn = ctk.CTkButton(child_frame, text="Link to a new kid account", command=self.add_child_account)
+        add_child_btn.pack(padx=30, pady=10, fill="x")
+
+        # Save settings button
+        save_btn = ctk.CTkButton(settings_frame, text="Save settings", command=self.save_settings)
+        save_btn.pack(padx=20, pady=20, fill="x")
+
+    # Helper methods for functionality
+
+    def add_app_to_list(self, app_name):
+        """Add an app to the blocked apps list"""
+        app_frame = ctk.CTkFrame(self.apps_list_frame)
+        app_frame.pack(padx=5, pady=5, fill="x")
+
+        app_label = ctk.CTkLabel(app_frame, text=app_name, width=200, anchor="w")
+        app_label.pack(side="left", padx=10)
+
+        remove_btn = ctk.CTkButton(app_frame, text="Remove", width=60,
+                                   command=lambda a=app_name, f=app_frame: self.remove_blocked_app(a, f))
+        remove_btn.pack(side="right", padx=10)
+
+        self.blocked_apps_widgets.append({"frame": app_frame, "name": app_name})
+
+    def add_website_to_list(self, website):
+        """Add a website to the blocked domains list"""
+        website_frame = ctk.CTkFrame(self.websites_list_frame)
+        website_frame.pack(padx=5, pady=5, fill="x")
+
+        website_label = ctk.CTkLabel(website_frame, text=website, width=200, anchor="w")
+        website_label.pack(side="left", padx=10)
+
+        remove_btn = ctk.CTkButton(website_frame, text="Remove", width=60,
+                                   command=lambda w=website, f=website_frame: self.remove_blocked_domain(w, f))
+        remove_btn.pack(side="right", padx=10)
+
+        self.blocked_websites_widgets.append({"frame": website_frame, "name": website})
+
+    # Action methods
+
+    def get_app_names(self):
+        """Request app list from server"""
+        try:
+            # Send request to server
+            get_arr_dict = {
+                "code": 'get_app_list',
+                "user": self.username,
+            }
+            answer_dict = self.send_direct_request(get_arr_dict)
+
+            if answer_dict['status'] == True:
+                apps = answer_dict['apps']
+                print(f'apps = {apps}')
+                # Clear current list
+                for widget in self.blocked_apps_widgets:
+                    widget["frame"].destroy()
+                self.blocked_apps_widgets = []
+
+                # Add apps to list
+                for app in apps:
+                    self.add_app_to_list(app)
+
+                return apps
+            else:
+                print(f"Error loading apps: {answer_dict.get('message', 'Unknown error')}")
+                return []
+        except Exception as e:
+            print(f"Error getting app names: {e}")
+            return []
+
+    def add_blocked_app(self):
+        """Add an app to the blocked list"""
+        app_name = self.app_entry.get()
+        if app_name:
+            try:
+                # Send request to server
+                request = {
+                    "code": "block_app",
+                    "username": self.username,
+                    "app_name": app_name
+                }
+
+                data = pickle.dumps(request)
+                data = self.AESenc(data)
+                send_with_size(self.sock, data)
+
+                # Add to local list (server will confirm)
+                self.add_app_to_list(app_name)
+                self.app_entry.delete(0, 'end')
+                messagebox.showinfo("Success", f"App {app_name} added to blocked list")
+
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to communicate with server: {e}")
+        else:
+            messagebox.showwarning("Error", "Please enter an application name")
+
+    def remove_blocked_app(self, app_name, frame):
+        """Remove an app from the blocked list"""
+        try:
+            # Send request to server
+            request = {
+                "code": "unblock_app",
+                "username": self.username,
+                "app_name": app_name
+            }
+
+            data = pickle.dumps(request)
+            data = self.AESenc(data)
+            send_with_size(self.sock, data)
+
+            # Remove from local list
+            frame.destroy()
+            self.blocked_apps_widgets = [w for w in self.blocked_apps_widgets if w["name"] != app_name]
+            messagebox.showinfo("Success", f"App {app_name} removed from blocked list")
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to communicate with server: {e}")
+
+    def get_domain_names(self):
+        """Get the list of blocked domains from server"""
+        try:
+            # Send request to server
+            get_arr_dict = {
+                "code": 'get_domains_list',
+                "user": self.username,
+            }
+            answer_dict = self.send_direct_request(get_arr_dict)
+
+            if answer_dict['status'] == True:
+                domains = answer_dict['domains']
+
+                # Clear current list
+                for widget in self.blocked_websites_widgets:
+                    widget["frame"].destroy()
+                self.blocked_websites_widgets = []
+
+                # Add domains to list
+                for domain in domains:
+                    self.add_website_to_list(domain)
+
+                return domains
+            else:
+                print(f"Error loading domains: {answer_dict.get('message', 'Unknown error')}")
+                return []
+        except Exception as e:
+            print(f"Error getting domain names: {e}")
+            return []
+
+    def add_blocked_domain(self):
+        """Add a domain to the blocked list"""
+        domain = self.website_entry.get()
+        if domain:
+            try:
+                # Send request to server
+                request = {
+                    "code": "block_domain",
+                    "username": self.username,
+                    "domain": domain
+                }
+
+                data = pickle.dumps(request)
+                data = self.AESenc(data)
+                send_with_size(self.sock, data)
+
+                # Add to local list (server will confirm)
+                self.add_website_to_list(domain)
+                self.website_entry.delete(0, 'end')
+                messagebox.showinfo("Success", f"Domain {domain} added to blocked list")
+
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to communicate with server: {e}")
+        else:
+            messagebox.showwarning("Error", "Please enter a domain name")
+
+    def remove_blocked_domain(self, domain, frame):
+        """Remove a domain from the blocked list"""
+        try:
+            # Send request to server
+            request = {
+                "code": "unblock_domain",
+                "username": self.username,
+                "domain": domain
+            }
+
+            data = pickle.dumps(request)
+            data = self.AESenc(data)
+            send_with_size(self.sock, data)
+
+            # Remove from local list
+            frame.destroy()
+            self.blocked_websites_widgets = [w for w in self.blocked_websites_widgets if w["name"] != domain]
+            messagebox.showinfo("Action Completed", f"Domain {domain} removed from blocked list")
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to communicate with server: {e}")
+
+    def on_child_select(self, child_name):
+        """Handle child selection change"""
+        self.current_child = child_name
+        self.update_time_display()
+
+    def update_time_display(self):
+        """Update the time display based on the selected child"""
+        # Get child data
+        if self.current_child not in self.child_time_data:
+            # Set default values if no data exists yet
+            self.child_time_data[self.current_child] = {
+                "limit_hours": 2,
+                "limit_minutes": 30,
+                "used_hours": 0,
+                "used_minutes": 0,
+                "connected": False
+            }
+
+        child_data = self.child_time_data[self.current_child]
+
+        # Calculate total minutes for limit and used
+        limit_hours = child_data.get("limit_hours", 2)
+        limit_minutes = child_data.get("limit_minutes", 30)
+        used_hours = child_data.get("used_hours", 0)
+        used_minutes = child_data.get("used_minutes", 0)
+
+        limit_total_minutes = (limit_hours * 60) + limit_minutes
+        used_total_minutes = (used_hours * 60) + used_minutes
+
+        # Calculate remaining time
+        remaining_minutes = max(0, limit_total_minutes - used_total_minutes)
+        remaining_hours = remaining_minutes // 60
+        remaining_mins = remaining_minutes % 60
+
+        # Update progress bar
+        if limit_total_minutes > 0:
+            progress = min(1.0, used_total_minutes / limit_total_minutes)
+        else:
+            progress = 0
+
+        self.progress_bar.set(progress)
+
+        # Update labels
+        self.limit_display.configure(
+            text=f"Daily Time Limit: {limit_hours}h {limit_minutes}m")
+        self.used_label.configure(
+            text=f"Used: {used_hours}h {used_minutes}m")
+        self.remaining_label.configure(
+            text=f"Remaining: {remaining_hours}h {remaining_mins}m")
+
+        # Update entry fields - clear and insert new values
+        self.hours_entry.delete(0, 'end')
+        self.hours_entry.insert(0, str(limit_hours))
+
+        self.minutes_entry.delete(0, 'end')
+        self.minutes_entry.insert(0, str(limit_minutes))
+
+        # Add connection status if available
+        connected = child_data.get("connected", False)
+        if connected:
+            self.limit_display.configure(text=f"Daily Time Limit: {limit_hours}h {limit_minutes}m (Child is Connected)")
+        else:
+            self.limit_display.configure(
+                text=f"Daily Time Limit: {limit_hours}h {limit_minutes}m (Child is Disconnected)")
+
+    def set_time_limit(self):
+        """Set a new time limit and send to server"""
+        try:
+            # Get values directly from entry widgets
+            hours = int(self.hours_entry.get())
+            minutes = int(self.minutes_entry.get())
+            child = self.current_child
+
+            if child == "No children":
+                messagebox.showwarning("Warning", "No child selected.")
+                return
+
+            # Validate input
+            if hours < 0 or minutes < 0 or minutes > 59:
+                messagebox.showwarning("Warning", "Please enter valid hours and minutes.")
+                return
+
+            # Calculate total minutes
+            total_minutes = hours * 60 + minutes
+
+            # Send request to server
+            request = {
+                "code": "set_time_limit",
+                "child": child,
+                "time_limit": total_minutes
+            }
+
+            data = pickle.dumps(request)
+            data = self.AESenc(data)
+            send_with_size(self.sock, data)
+
+            # Update local data
+            if child in self.child_time_data:
+                self.child_time_data[child]["limit_hours"] = hours
+                self.child_time_data[child]["limit_minutes"] = minutes
+            else:
+                self.child_time_data[child] = {
+                    "limit_hours": hours,
+                    "limit_minutes": minutes,
+                    "used_hours": 0,
+                    "used_minutes": 0
+                }
+
+            # Update the display
+            self.update_time_display()
+
+            # Show confirmation
+            messagebox.showinfo("Success", f"Time limit set to {hours}h {minutes}m for {child}")
+
+        except ValueError:
+            messagebox.showwarning("Error", "Please enter valid numbers for hours and minutes")
+        except Exception as e:
+            messagebox.showerror("Error", f"An error occurred: {str(e)}")
+
+    def add_time_range_to_list(self, range_data):
+        """Add a time range to the allowed times list (placeholder for future feature)"""
+        pass
+
+    def add_child_account(self):
+        """Show dialog to add child account"""
+        messagebox.showinfo("Coming Soon", "This functionality will be available soon")
+
+    def save_settings(self):
+        """Save notification settings (placeholder for future feature)"""
+        messagebox.showinfo("Action Completed", "Settings saved successfully")
+
+    def block_all_devices(self):
+        """Block all child devices (placeholder for future feature)"""
+        for child_name in self.children_names:
+            if child_name in self.child_time_data and self.child_time_data[child_name].get("connected", False):
+                # TODO: Implement actual blocking through server
+                self.show_notification(f"Blocked all devices for {child_name}")
+
+        messagebox.showinfo("Action Completed", "All connected devices have been blocked")
+
+    def extend_screen_time(self):
+        """Add extra screen time to a child (placeholder for future feature)"""
+        # Request current child
+        if not self.current_child or self.current_child == "No children":
+            messagebox.showwarning("Warning", "Please select a child first")
+            return
+
+        # Simple dialog to get extra time
+        extra_minutes = simpledialog.askinteger("Add Screen Time",
+                                                f"Enter extra minutes for {self.current_child}:",
+                                                minvalue=5, maxvalue=120)
+
+        if extra_minutes:
+            # TODO: Implement server request to add time
+            messagebox.showinfo("Success", f"Added {extra_minutes} minutes to {self.current_child}'s screen time")
+
+    def show_notification(self, message):
+        """Show a notification to the user"""
+        # Create a notification window
+        notification = tk.Toplevel(self)
+        notification.title("Notification")
+        notification.geometry("300x100")
+        notification.attributes('-topmost', True)
+
+        # Add message
+        label = ctk.CTkLabel(notification, text=message, wraplength=280)
+        label.pack(padx=20, pady=20)
+
+        # Auto-close after 5 seconds
+        notification.after(5000, notification.destroy)
+
+
+# Import for dialog
+from tkinter import simpledialog
+
+# Example usage:
+if __name__ == "__main__":
+    # This would be called after successful login
+    app = ParentDashboard(None, "Parent", b'1234567890123456')  # Sample encryption key
+    app.mainloop()

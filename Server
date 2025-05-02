@@ -1,0 +1,1829 @@
+import socket
+import threading
+import os
+from tcp_by_size import recv_by_size, send_with_size
+import pickle
+import psutil
+import pickle
+import secrets
+import hashlib
+import socket
+import threading
+from tcp_by_size import recv_by_size, send_with_size
+import random
+import string
+import time
+import sys
+# from sendgrid import SendGridAPIClient
+# from sendgrid.helpers.mail import Mail
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad, unpad
+from Crypto.Random import get_random_bytes
+import sqlite3
+import bcrypt
+import json
+
+PORT = 5050
+key = ''
+
+# Global tracking dictionaries
+connected_parents = {}  # Format: {parent_id: {"sock": socket, "last_update": timestamp}}
+connected_children = {}  # Format: {child_id: {"sock": socket, "connected_time": timestamp, "used_time": minutes}}
+
+socks = []
+
+
+# ================ Database Helper Functions ================
+
+def get_user_id(username):
+    """Get the user_id for a given username"""
+    try:
+        conn = sqlite3.connect('userData.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id FROM users WHERE username = ?", (username,))
+        result = cursor.fetchone()
+        conn.close()
+        return result[0] if result else None
+    except Exception as e:
+        print(f"Error getting user_id: {e}")
+        return None
+
+
+def get_user_role(username):
+    """Get the role (Parent/Child) for a given username"""
+    try:
+        conn = sqlite3.connect('userData.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT role FROM users WHERE username = ?", (username,))
+        result = cursor.fetchone()
+        conn.close()
+        return result[0] if result else None
+    except Exception as e:
+        print(f"Error getting user role: {e}")
+        return None
+
+
+def get_child_id_from_db(username):
+    """Get child_id from username"""
+    return get_user_id(username)
+
+
+def get_accumulated_time_from_db(child_id):
+    """Get accumulated screen time for a child"""
+    try:
+        conn = sqlite3.connect('userData.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT used_time FROM time_limits WHERE child_id = ?", (child_id,))
+        result = cursor.fetchone()
+        conn.close()
+        # Always return 0 if NULL or not found
+        return result[0] if result and result[0] is not None else 0
+    except Exception as e:
+        print(f"Error getting accumulated time: {e}")
+        return 0
+
+
+def update_accumulated_time_in_db(child_id, total_time):
+    """Update the accumulated screen time for a child"""
+    try:
+        conn = sqlite3.connect('userData.db')
+        cursor = conn.cursor()
+        cursor.execute("UPDATE time_limits SET used_time = ? WHERE child_id = ?", (total_time, child_id))
+        if cursor.rowcount == 0:
+            # If no row was updated, insert a new one
+            cursor.execute("INSERT INTO time_limits (child_id, used_time) VALUES (?, ?)", (child_id, total_time))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        print(f"Error updating accumulated time: {e}")
+        return False
+
+
+def get_children_ids_for_parent(parent_id):
+    """Get all children IDs linked to a parent"""
+    try:
+        conn = sqlite3.connect('userData.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT child_id FROM relationships WHERE parent_id = ?", (parent_id,))
+        results = cursor.fetchall()
+        conn.close()
+        return [row[0] for row in results]
+    except Exception as e:
+        print(f"Error getting children IDs: {e}")
+        return []
+
+
+def get_username_for_child_id(child_id):
+    """Get username for a child_id"""
+    try:
+        conn = sqlite3.connect('userData.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT username FROM users WHERE user_id = ?", (child_id,))
+        result = cursor.fetchone()
+        conn.close()
+        return result[0] if result else "Unknown"
+    except Exception as e:
+        print(f"Error getting username: {e}")
+        return "Unknown"
+
+
+def get_time_limit_for_child(child_id):
+    """Get the screen time limit for a child"""
+    try:
+        conn = sqlite3.connect('userData.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT time_limit FROM time_limits WHERE child_id = ?", (child_id,))
+        result = cursor.fetchone()
+        conn.close()
+        return result[0] if result else 1440  # Default to 24 hours (1440 minutes)
+    except Exception as e:
+        print(f"Error getting time limit: {e}")
+        return 1440
+
+
+def get_parent_ids_for_child(child_id):
+    """Get all parent IDs linked to a child"""
+    try:
+        conn = sqlite3.connect('userData.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT parent_id FROM relationships WHERE child_id = ?", (child_id,))
+        results = cursor.fetchall()
+        conn.close()
+        return [row[0] for row in results]
+    except Exception as e:
+        print(f"Error getting parent IDs: {e}")
+        return []
+
+
+def get_blocked_apps_for_child(child_id):
+    """Get list of blocked applications for a child"""
+    try:
+        conn = sqlite3.connect('userData.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT app_names FROM blocked_apps WHERE child_id = ?", (child_id,))
+        result = cursor.fetchone()
+        conn.close()
+
+        if result and result[0]:
+            try:
+                return json.loads(result[0])
+            except json.JSONDecodeError:
+                return []
+        return []
+    except Exception as e:
+        print(f"Error getting blocked apps: {e}")
+        return []
+
+
+def get_blocked_domains_for_child(child_id):
+    """Get list of blocked domains for a child"""
+    try:
+        conn = sqlite3.connect('userData.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT domains FROM blocked_websites WHERE child_id = ?", (child_id,))
+        result = cursor.fetchone()
+        conn.close()
+
+        if result and result[0]:
+            try:
+                return json.loads(result[0])
+            except json.JSONDecodeError:
+                return []
+        return []
+    except Exception as e:
+        print(f"Error getting blocked domains: {e}")
+        return []
+
+
+def update_blocked_apps_for_child(child_id, apps_list):
+    """Update the list of blocked applications for a child"""
+    try:
+        conn = sqlite3.connect('userData.db')
+        cursor = conn.cursor()
+        apps_json = json.dumps(apps_list)
+
+        cursor.execute("UPDATE blocked_apps SET app_names = ? WHERE child_id = ?",
+                       (apps_json, child_id))
+
+        if cursor.rowcount == 0:
+            cursor.execute(
+                "INSERT INTO blocked_apps (child_id, app_names, date_added) VALUES (?, ?, CURRENT_TIMESTAMP)",
+                (child_id, apps_json))
+
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        print(f"Error updating blocked apps: {e}")
+        return False
+
+
+def update_blocked_domains_for_child(child_id, domains_list):
+    """Update the list of blocked domains for a child"""
+    try:
+        conn = sqlite3.connect('userData.db')
+        cursor = conn.cursor()
+        domains_json = json.dumps(domains_list)
+
+        cursor.execute("UPDATE blocked_websites SET domains = ? WHERE child_id = ?",
+                       (domains_json, child_id))
+
+        if cursor.rowcount == 0:
+            cursor.execute(
+                "INSERT INTO blocked_websites (child_id, domains, date_added) VALUES (?, ?, CURRENT_TIMESTAMP)",
+                (child_id, domains_json))
+
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        print(f"Error updating blocked domains: {e}")
+        return False
+
+
+def is_user_active(user_id):
+    """Check if a user is active in the database"""
+    try:
+        conn = sqlite3.connect('userData.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT is_active FROM users WHERE user_id = ?", (user_id,))
+        result = cursor.fetchone()
+        conn.close()
+        return result[0] if result else False
+    except Exception as e:
+        print(f"Error checking user activity: {e}")
+        return False
+
+
+# ================ Connection Management Functions ================
+
+def register_connected_parent(parent_id, sock):
+    """Register a parent as connected when they log in"""
+    connected_parents[parent_id] = {
+        "sock": sock,
+        "last_update": time.time()
+    }
+    print(f"Parent {parent_id} registered as connected")
+
+
+def register_connected_child(child_id, sock):
+    """Register a child as connected when they log in"""
+    # Get previous used time from database
+    previous_time = get_accumulated_time_from_db(child_id)
+
+    connected_children[child_id] = {
+        "sock": sock,
+        "connected_time": time.time(),
+        "used_time": previous_time
+    }
+
+    print(f"Child {child_id} registered as connected")
+
+    # Notify all relevant parents
+    notify_parents_of_child_connection(child_id, True)
+
+
+def unregister_child(child_id):
+    """Handle child disconnection"""
+    if child_id in connected_children:
+        # Calculate session duration
+        session_duration = (time.time() - connected_children[child_id]["connected_time"]) / 60  # in minutes
+        total_time = connected_children[child_id]["used_time"] + session_duration
+
+        # Update database
+        update_accumulated_time_in_db(child_id, total_time)
+
+        # Remove from tracking
+        del connected_children[child_id]
+
+        print(f"Child {child_id} unregistered")
+
+        # Notify parents
+        notify_parents_of_child_connection(child_id, False)
+
+
+def unregister_parent(parent_id):
+    """Handle parent disconnection"""
+    if parent_id in connected_parents:
+        del connected_parents[parent_id]
+        print(f"Parent {parent_id} unregistered")
+
+
+def notify_parents_of_child_connection(child_id, is_connected):
+    """Notify all parents of a child about connection status change"""
+    # Get parent IDs for this child
+    parent_ids = get_parent_ids_for_child(child_id)
+    child_username = get_username_for_child_id(child_id)
+
+    status_text = "connected" if is_connected else "disconnected"
+
+    # Prepare notification
+    notification = {
+        "code": "notification",
+        "content": f"{child_username} has {status_text} at {time.strftime('%H:%M:%S')}"
+    }
+
+    # Send to each connected parent
+    for parent_id in parent_ids:
+        if parent_id in connected_parents:
+            try:
+                data = pickle.dumps(notification)
+                data = AESenc(data)
+                send_with_size(connected_parents[parent_id]["sock"], data)
+            except Exception as e:
+                print(f"Failed to notify parent {parent_id}: {e}")
+
+
+# ================ Status Update Manager ================
+
+def register_activity(child_id, activity_type, details=None):
+    """Log an activity for a child"""
+    try:
+        conn = sqlite3.connect('userData.db')
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            INSERT INTO activity_log (child_id, activity_type, details)
+            VALUES (?, ?, ?)
+        """, (child_id, activity_type, details))
+
+        conn.commit()
+        conn.close()
+
+        # Notify parents about the activity
+        child_username = get_username_for_child_id(child_id)
+        notification_text = f"{child_username}: {activity_type}"
+        if details:
+            notification_text += f" - {details}"
+
+        # Get parent IDs for this child
+        parent_ids = get_parent_ids_for_child(child_id)
+
+        # Prepare notification
+        notification = {
+            "code": "notification",
+            "content": notification_text
+        }
+
+        # Send to each connected parent
+        for parent_id in parent_ids:
+            if parent_id in connected_parents:
+                try:
+                    data = pickle.dumps(notification)
+                    data = AESenc(data)
+                    send_with_size(connected_parents[parent_id]["sock"], data)
+                except Exception as e:
+                    print(f"Failed to notify parent {parent_id}: {e}")
+
+        return True
+    except Exception as e:
+        print(f"Error logging activity: {e}")
+        return False
+
+
+def get_activity_logs(child_id, limit=20):
+    """Get recent activity logs for a child"""
+    try:
+        conn = sqlite3.connect('userData.db')
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT activity_type, details, timestamp
+            FROM activity_log 
+            WHERE child_id = ?
+            ORDER BY timestamp DESC
+            LIMIT ?
+        """, (child_id, limit))
+
+        logs = cursor.fetchall()
+        conn.close()
+
+        # Format logs for easy consumption
+        formatted_logs = []
+        for log in logs:
+            activity_type, details, timestamp = log
+            formatted_logs.append({
+                "type": activity_type,
+                "details": details,
+                "timestamp": timestamp
+            })
+
+        return formatted_logs
+    except Exception as e:
+        print(f"Error getting activity logs: {e}")
+        return []
+
+
+def check_time_limits():
+    """Check time limits for all connected children and enforce if needed"""
+    for child_id, data in list(connected_children.items()):  # Use list to avoid modification during iteration
+        try:
+            # Calculate current session time
+            current_time = time.time()
+            connected_time = data["connected_time"]
+            session_duration = (current_time - connected_time) / 60  # in minutes
+            total_time = data["used_time"] + session_duration
+
+            # Get time limit
+            time_limit = get_time_limit_for_child(child_id)
+
+            # Check if limit is exceeded
+            if total_time >= time_limit:
+                child_username = get_username_for_child_id(child_id)
+                print(f"Time limit reached for child {child_username}")
+
+                # Log the activity
+                register_activity(child_id, "time_limit_reached",
+                                  f"Used: {total_time:.1f} minutes, Limit: {time_limit} minutes")
+
+                # Notify the child
+                if "sock" in data:
+                    try:
+                        notification = {
+                            "code": "time_limit_reached",
+                            "message": "Your screen time limit has been reached."
+                        }
+
+                        notif_data = pickle.dumps(notification)
+                        notif_data = AESenc(notif_data)
+                        send_with_size(data["sock"], notif_data)
+                    except Exception as e:
+                        print(f"Error notifying child {child_id}: {e}")
+        except Exception as e:
+            print(f"Error checking time limit for child {child_id}: {e}")
+
+
+# Update the status_update_manager to include time limit checks
+def status_update_manager():
+    """Thread that sends periodic updates to connected parent clients and checks time limits"""
+    update_interval = 30  # seconds between updates
+    last_time_check = 0
+
+    while True:
+        try:
+            current_time = time.time()
+
+            # Check time limits every minute
+            if current_time - last_time_check >= 60:
+                check_time_limits()
+                last_time_check = current_time
+
+            # Get all parent sockets that need updates
+            parents_to_update = get_connected_parents()
+
+            # Process each parent client
+            for parent_id, sock in parents_to_update.items():
+                try:
+                    # Generate status update for this parent
+                    children_status = generate_children_status_for_parent(parent_id)
+
+                    # Send the update
+                    response = {
+                        "code": "children_status_update",
+                        "status": True,
+                        "children": children_status
+                    }
+
+                    data = pickle.dumps(response)
+                    data = AESenc(data)
+                    send_with_size(sock, data)
+                except Exception as e:
+                    print(f"Error updating parent {parent_id}: {e}")
+
+            # Sleep for the update interval
+            time.sleep(update_interval)
+        except Exception as e:
+            print(f"Error in status update manager: {e}")
+            time.sleep(5)  # Brief pause before retry if there's an error
+
+
+def get_connected_parents():
+    """Return a dictionary of connected parent IDs and their sockets"""
+    # Could add filtering here to only include parents who need updates
+    return {parent_id: data["sock"] for parent_id, data in connected_parents.items()}
+
+
+def generate_children_status_for_parent(parent_id):
+    """Generate status updates for all children of a parent"""
+    # Get all children IDs for this parent
+    children_ids = get_children_ids_for_parent(parent_id)
+
+    children_status = []
+    for child_id in children_ids:
+        child_username = get_username_for_child_id(child_id)
+        is_connected = child_id in connected_children
+
+        if is_connected:
+            # Calculate current session time
+            current_session = (time.time() - connected_children[child_id]["connected_time"]) / 60  # in minutes
+            total_time = connected_children[child_id]["used_time"] + current_session
+        else:
+            # Get time from database
+            total_time = get_accumulated_time_from_db(child_id)
+
+        # Get time limit
+        time_limit = get_time_limit_for_child(child_id)
+
+        children_status.append({
+            "username": child_username,
+            "connected": is_connected,
+            "used_time": total_time,
+            "time_limit": time_limit
+        })
+
+    return children_status
+
+
+# ================ Main Handler Functions ================
+
+def signup(request_dict, sock):
+    print('in signup')
+    username = request_dict['user']
+    password = request_dict['password']
+    email = request_dict['email']
+    role = request_dict['role']
+
+    # Connect to the SQLite database
+    conn = sqlite3.connect('userData.db')
+    cursor = conn.cursor()
+
+    # Check if username already exists
+    cursor.execute("SELECT username FROM users WHERE username = ?", (username,))
+    existing_user = cursor.fetchone()
+
+    if existing_user:
+        # Username already exists, send failure message
+        conn.close()
+        confirm_msg('signup', False, sock)
+        print('user exists')
+        return False
+
+    # Check if email already exists (optional, depending on your requirements)
+    cursor.execute("SELECT email FROM users WHERE email = ?", (email,))
+    existing_email = cursor.fetchone()
+
+    if existing_email:
+        # Email already exists, send failure message
+        conn.close()
+        confirm_msg('signup', False, sock)
+        print('email exists')
+        return False
+
+    try:
+        salt = bcrypt.gensalt()
+        hashed_password = bcrypt.hashpw(password.encode(), salt)
+        is_active = True
+
+        # Insert the new user into the users table
+        cursor.execute("""
+               INSERT INTO users (username, password_hash, email, salt, role, account_created, last_login, is_active, preferences, limit_settings)
+               VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?, ?, ?)
+           """, (username, hashed_password, email, salt, role, is_active, None, None))
+
+        print('in the users table')
+
+        # Commit the transaction
+        conn.commit()
+        conn.close()
+        return True
+
+    except Exception as e:
+        # Handle exceptions (database errors, etc.)
+        print(f"Error during signup: {e}")
+        conn.close()
+        return False
+
+
+def login(request_dict, sock):
+    username = request_dict['user']
+    password = request_dict['password']
+
+    print(f"Login attempt for user: '{username}'")
+
+    # Make sure we can access the database
+    if not os.path.exists('userData.db'):
+        print("ERROR: Database file not found!")
+        status = False
+        role = None
+    else:
+        try:
+            conn = sqlite3.connect('userData.db', timeout=10)  # Add timeout
+            cursor = conn.cursor()
+
+            # Debug - print all users
+            cursor.execute("SELECT username, role FROM users")
+            all_users = cursor.fetchall()
+            print(f"All users in DB: {all_users}")
+
+            # Try to find this specific user
+            cursor.execute("SELECT password_hash, salt, role, user_id FROM users WHERE username = ?", (username,))
+            result = cursor.fetchone()
+
+            print(f"Query result for '{username}': {result}")
+
+            if result:
+                stored_hash, salt, role, user_id = result
+                hashed_password = bcrypt.hashpw(password.encode(), salt)
+
+                # Check if the entered password matches the stored hash
+                if hashed_password == stored_hash:
+                    # Update the last login time
+                    cursor.execute("UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE username = ?",
+                                   (username,))
+                    conn.commit()
+                    status = True
+                    print(f"Login successful for {username}, role: {role}")
+
+                    # Register the user as connected based on role
+                    if role == "Parent":
+                        register_connected_parent(user_id, sock)
+                    elif role == "Child":
+                        register_connected_child(user_id, sock)
+                else:
+                    status = False
+                    print("Password mismatch")
+            else:
+                status = False
+                role = None
+                print(f"User '{username}' not found")
+
+        except sqlite3.Error as e:
+            print(f"SQLite error: {e}")
+            status = False
+            role = None
+
+        except Exception as e:
+            print(f"Unexpected error: {e}")
+            status = False
+            role = None
+
+        finally:
+            if 'conn' in locals():
+                conn.close()
+
+    # Send response
+    response_dict = {
+        "code": "login",
+        "status": status,
+        "role": role
+    }
+
+    data = pickle.dumps(response_dict)
+    data = AESenc(data)
+    send_with_size(sock, data)
+
+    # Return success indicator for the client handler
+    return "success" if status else None
+
+
+def get_parents(sock):
+    try:
+        conn = sqlite3.connect('userData.db')
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT username FROM users WHERE role = 'Parent'")
+        results = cursor.fetchall()
+        parents = [row[0] for row in results]
+        print(parents)
+
+        status = True
+        message = ""
+
+    except sqlite3.Error as e:
+        parents = []
+        status = False
+        message = str(e)
+
+    except Exception as e:
+        parents = []
+        status = False
+        message = f"Unexpected error: {str(e)}"
+
+    finally:
+        conn.close()
+
+    return_dict = {
+        "status": status,
+        "message": message,
+        "parents": parents
+    }
+
+    data = pickle.dumps(return_dict)
+    data = AESenc(data)
+    send_with_size(sock, data)
+
+
+def link_parent(request_dict, sock):
+    child_username = request_dict['child_username']
+    parent_username = request_dict['parent_username']
+
+    # Get IDs from usernames
+    child_id = get_user_id(child_username)
+    parent_id = get_user_id(parent_username)
+
+    if not child_id or not parent_id:
+        print(f"Child '{child_username}' or parent '{parent_username}' not found")
+        return False
+
+    try:
+        conn = sqlite3.connect('userData.db')
+        cursor = conn.cursor()
+
+        # Check if the parent already has other children
+        cursor.execute("SELECT child_id FROM relationships WHERE parent_id = ?", (parent_id,))
+        existing_children = cursor.fetchall()
+
+        # Create the relationship between parent and new child
+        cursor.execute("""
+                    INSERT INTO relationships (parent_id, child_id)
+                    VALUES (?, ?)
+                """, (parent_id, child_id))
+
+        empty_json = json.dumps([])
+
+        # Insert into blocked_websites if not exists
+        cursor.execute("SELECT 1 FROM blocked_websites WHERE child_id = ?", (child_id,))
+        if not cursor.fetchone():
+            cursor.execute("""
+                INSERT INTO blocked_websites (child_id, domains, date_added)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+            """, (child_id, empty_json))
+            print('Added entry in blocked_websites table')
+
+        # Insert into blocked_apps if not exists
+        cursor.execute("SELECT 1 FROM blocked_apps WHERE child_id = ?", (child_id,))
+        if not cursor.fetchone():
+            cursor.execute("""
+                INSERT INTO blocked_apps (child_id, app_names, date_added)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+            """, (child_id, empty_json))
+            print('Added entry in blocked_apps table')
+
+        # Insert into time_limits if not exists
+        cursor.execute("SELECT 1 FROM time_limits WHERE child_id = ?", (child_id,))
+        if not cursor.fetchone():
+            cursor.execute("""
+                INSERT INTO time_limits (child_id, time_limit, used_time)
+                VALUES (?, ?, ?)
+            """, (child_id, 1440, 0))
+            print('Added entry in time_limits table')
+
+        # If parent has existing children, copy block settings from the first one
+        if existing_children:
+            previous_child_id = existing_children[0][0]
+            print(f"Parent has existing children. Using settings from child_id: {previous_child_id}")
+
+            # Copy blocked apps settings
+            previous_apps = get_blocked_apps_for_child(previous_child_id)
+            if previous_apps:
+                update_blocked_apps_for_child(child_id, previous_apps)
+                print(f"Copied blocked apps to new child: {previous_apps}")
+
+            # Copy blocked websites settings
+            previous_domains = get_blocked_domains_for_child(previous_child_id)
+            if previous_domains:
+                update_blocked_domains_for_child(child_id, previous_domains)
+                print(f"Copied blocked domains to new child: {previous_domains}")
+
+        # Commit the transaction
+        conn.commit()
+        print(f"Successfully linked parent '{parent_username}' to child '{child_username}'")
+        return True
+
+    except sqlite3.Error as e:
+        print(f"Database error in link_parent: {str(e)}")
+        if conn:
+            conn.rollback()
+        return False
+
+    except Exception as e:
+        print(f"Unexpected error in link_parent: {str(e)}")
+        if conn:
+            conn.rollback()
+        return False
+
+    finally:
+        if 'conn' in locals() and conn:
+            conn.close()
+
+
+def block_app(request, sock):
+    print('in block_app')
+
+    try:
+        # Getting the data from the client
+        username = request.get("username")
+        app_name = request.get("app_name")
+
+        # Check if required fields are present
+        if not username or not app_name:
+            print("Error: Missing username or app_name in request")
+            return False
+
+        # Get parent ID
+        parent_id = get_user_id(username)
+        if not parent_id:
+            print(f"Error: User '{username}' not found")
+            return False
+
+        print(f'user id for {username} is - {parent_id}')
+
+        # Get children IDs
+        children_ids = get_children_ids_for_parent(parent_id)
+        if not children_ids:
+            print(f"Parent '{username}' has no registered children")
+            return True
+
+        print(f"Children IDs: {children_ids}")
+
+        for child_id in children_ids:
+            print(f'Processing child ID: {child_id}')
+
+            # Get current blocked apps
+            app_names = get_blocked_apps_for_child(child_id)
+
+            # Check if app is already blocked
+            if app_name in app_names:
+                print(f"App '{app_name}' is already blocked for child_id '{child_id}'")
+                continue  # Skip to next child
+
+            # Add the app to blocked list
+            app_names.append(app_name)
+
+            # Update the database
+            update_blocked_apps_for_child(child_id, app_names)
+
+        return True
+
+    except Exception as e:
+        print(f"Unexpected error in block_app: {e}")
+        return False
+
+
+def unblock_app(request, sock):
+    print('in unblock_app')
+
+    try:
+        # Getting the data from the client
+        username = request.get("username")
+        app_name = request.get("app_name")
+
+        # Check if required fields are present
+        if not username or not app_name:
+            print("Error: Missing username or app_name in request")
+            return False
+
+        # Get parent ID
+        parent_id = get_user_id(username)
+        if not parent_id:
+            print(f"Error: User '{username}' not found")
+            return False
+
+        print(f'user id for {username} is - {parent_id}')
+
+        # Get children IDs
+        children_ids = get_children_ids_for_parent(parent_id)
+        if not children_ids:
+            print(f"Parent '{username}' has no registered children")
+            return True
+
+        print(f"Children IDs: {children_ids}")
+
+        for child_id in children_ids:
+            print(f'Processing child ID: {child_id}')
+
+            # Get current blocked apps
+            app_names = get_blocked_apps_for_child(child_id)
+
+            # Check if app is already not blocked
+            if app_name not in app_names:
+                print(f"App '{app_name}' is not blocked for child_id '{child_id}'")
+                continue  # Skip to next child
+
+            # Remove the app from blocked list
+            app_names.remove(app_name)
+
+            # Update the database
+            update_blocked_apps_for_child(child_id, app_names)
+
+        return True
+
+    except Exception as e:
+        print(f"Unexpected error in unblock_app: {e}")
+        return False
+
+
+def get_app_list(request, sock):
+    print('in get apps list')
+    parent_username = request['user']
+
+    # Initialize response dictionary
+    response_dict = {
+        "code": "get_app_list",
+        "status": False,
+        "message": "",
+        "apps": []
+    }
+
+    # Check required fields
+    if not parent_username:
+        print("Error: Missing username in request")
+        response_dict["message"] = "Missing username"
+    else:
+        try:
+            # Get parent ID
+            parent_id = get_user_id(parent_username)
+
+            if not parent_id:
+                print(f"Error: User '{parent_username}' not found")
+                response_dict["message"] = f"User '{parent_username}' not found"
+            else:
+                print(f'User ID for {parent_username} is {parent_id}')
+
+                # Get children IDs
+                children_ids = get_children_ids_for_parent(parent_id)
+
+                if not children_ids:
+                    print(f"Parent '{parent_username}' has no registered children")
+                    response_dict["status"] = True
+                    response_dict["message"] = "No children found"
+                else:
+                    print(f"Children IDs: {children_ids}")
+
+                    # Get first child's blocked apps (assuming same apps blocked for all children)
+                    # This could be enhanced to consolidate apps from all children if needed
+                    if children_ids:
+                        first_child_id = children_ids[0]
+                        app_names = get_blocked_apps_for_child(first_child_id)
+                        print(f'for child {first_child_id} blocked apps is {app_names}')
+
+                        response_dict["status"] = True
+                        response_dict["message"] = "Success"
+                        response_dict["apps"] = app_names
+
+        except Exception as e:
+            print(f"Unexpected error in get_app_list: {e}")
+            response_dict["message"] = f"Unexpected error: {str(e)}"
+            import traceback
+            traceback.print_exc()
+
+    # Send the response
+    data = pickle.dumps(response_dict)
+    data = AESenc(data)
+    send_with_size(sock, data)
+    return None
+
+
+def get_domains_list(request, sock):
+    print('in get domains list')
+    parent_username = request['user']
+
+    # Initialize response dictionary
+    response_dict = {
+        "code": "get_domains_list",
+        "status": False,
+        "message": "",
+        "domains": []
+    }
+
+    # Check required fields
+    if not parent_username:
+        print("Error: Missing username in request")
+        response_dict["message"] = "Missing username"
+    else:
+        try:
+            # Get parent ID
+            parent_id = get_user_id(parent_username)
+
+            if not parent_id:
+                print(f"Error: User '{parent_username}' not found")
+                response_dict["message"] = f"User '{parent_username}' not found"
+            else:
+                print(f'User ID for {parent_username} is {parent_id}')
+
+                # Get children IDs
+                children_ids = get_children_ids_for_parent(parent_id)
+
+                if not children_ids:
+                    print(f"Parent '{parent_username}' has no registered children")
+                    response_dict["status"] = True
+                    response_dict["message"] = "No children found"
+                else:
+                    print(f"Children IDs: {children_ids}")
+
+                    # Get first child's blocked domains
+                    if children_ids:
+                        first_child_id = children_ids[0]
+                        domains = get_blocked_domains_for_child(first_child_id)
+
+                        response_dict["status"] = True
+                        response_dict["message"] = "Success"
+                        response_dict["domains"] = domains
+
+        except Exception as e:
+            print(f"Unexpected error in get_domains_list: {e}")
+            response_dict["message"] = f"Unexpected error: {str(e)}"
+            import traceback
+            traceback.print_exc()
+
+    # Send the response
+    data = pickle.dumps(response_dict)
+    data = AESenc(data)
+    send_with_size(sock, data)
+    return None
+
+
+def block_domain(request, sock):
+    print('in block_domain')
+
+    try:
+        # Getting the data from the client
+        username = request.get("username")
+        domain = request.get("domain")
+
+        # Check if required fields are present
+        if not username or not domain:
+            print("Error: Missing username or domain in request")
+            return False
+
+        # Get parent ID
+        parent_id = get_user_id(username)
+        if not parent_id:
+            print(f"Error: User '{username}' not found")
+            return False
+
+        print(f'user id for {username} is - {parent_id}')
+
+        # Get children IDs
+        children_ids = get_children_ids_for_parent(parent_id)
+        if not children_ids:
+            print(f"Parent '{username}' has no registered children")
+            return True
+
+        print(f"Children IDs: {children_ids}")
+
+        for child_id in children_ids:
+            # Get current blocked domains
+            domains = get_blocked_domains_for_child(child_id)
+
+            # Check if domain is already blocked
+            if domain in domains:
+                print(f"Domain '{domain}' is already blocked for child_id '{child_id}'")
+                continue  # Skip to next child
+
+            # Add the domain to blocked list
+            domains.append(domain)
+
+            # Update the database
+            update_blocked_domains_for_child(child_id, domains)
+
+        return True
+
+    except Exception as e:
+        print(f"Unexpected error in block_domain: {e}")
+        return False
+
+
+def unblock_domain(request, sock):
+    print('in unblock_domain')
+
+    try:
+        # Getting the data from the client
+        username = request.get("username")
+        domain = request.get("domain")
+
+        # Check if required fields are present
+        if not username or not domain:
+            print("Error: Missing username or domain in request")
+            return False
+
+        # Get parent ID
+        parent_id = get_user_id(username)
+        if not parent_id:
+            print(f"Error: User '{username}' not found")
+            return False
+
+        print(f'user id for {username} is - {parent_id}')
+
+        # Get children IDs
+        children_ids = get_children_ids_for_parent(parent_id)
+        if not children_ids:
+            print(f"Parent '{username}' has no registered children")
+            return True
+
+        print(f"Children IDs: {children_ids}")
+
+        for child_id in children_ids:
+            # Get current blocked domains
+            domains = get_blocked_domains_for_child(child_id)
+
+            # Check if domain is not blocked
+            if domain not in domains:
+                print(f"Domain '{domain}' is not blocked for child_id '{child_id}'")
+                continue  # Skip to next child
+
+            # Remove the domain from blocked list
+            domains.remove(domain)
+
+            # Update the database
+            update_blocked_domains_for_child(child_id, domains)
+
+        return True
+
+    except Exception as e:
+        print(f"Unexpected error in unblock_domain: {e}")
+        return False
+
+
+def set_time_limit(request, sock):
+    print('in set_time_limit')
+
+    try:
+        # Getting the data from the client
+        child_name = request.get("child")
+        time_limit = request.get("time_limit")
+
+        # Check if required fields are present
+        if not child_name or not time_limit:
+            print("Error: Missing child name or time_limit in request")
+            return False
+
+        # Get child ID
+        child_id = get_user_id(child_name)
+        if not child_id:
+            print(f"Child '{child_name}' does not exist")
+            return False
+
+        try:
+            conn = sqlite3.connect('userData.db')
+            cursor = conn.cursor()
+
+            # Update the database
+            cursor.execute("UPDATE time_limits SET time_limit = ? WHERE child_id = ?",
+                           (time_limit, child_id))
+
+            # Check if any rows were affected
+            if cursor.rowcount == 0:
+                # No rows updated - need to insert a new record
+                cursor.execute("INSERT INTO time_limits (child_id, time_limit, used_time) VALUES (?, ?, ?)",
+                               (child_id, time_limit, 0))
+
+            conn.commit()
+            conn.close()
+            return True
+
+        except sqlite3.Error as e:
+            print(f"Database error: {e}")
+            if conn:
+                conn.rollback()
+            return False
+
+    except Exception as e:
+        print(f"Unexpected error in set_time_limit: {e}")
+        return False
+
+
+def get_children(request, sock):
+    parent_name = request['user']
+
+    # Initialize response
+    children_dict = {}
+    status = False
+    message = ""
+
+    try:
+        # Get parent ID
+        parent_id = get_user_id(parent_name)
+        if not parent_id:
+            message = f"Parent '{parent_name}' not found"
+        else:
+            # Get children IDs
+            children_ids = get_children_ids_for_parent(parent_id)
+            print(f'the children ids - {children_ids}')
+
+            for child_id in children_ids:
+                # Get username and active status
+                username = get_username_for_child_id(child_id)
+                is_active = is_user_active(child_id)
+
+                # Set connected status (1 if connected, 0 if not)
+                is_connected = 1 if child_id in connected_children else 0
+
+                children_dict[username] = is_connected
+
+            status = True
+
+    except Exception as e:
+        print(f"Error in get_children: {e}")
+        message = f"Unexpected error: {str(e)}"
+
+    return_dict = {
+        "status": status,
+        "message": message,
+        "children": children_dict
+    }
+
+    data = pickle.dumps(return_dict)
+    data = AESenc(data)
+    send_with_size(sock, data)
+
+
+def get_children_status(request, sock):
+    """Get detailed status info about a parent's children"""
+    username = request.get("username")
+    full_update = request.get("full_update", True)
+
+    response = {
+        "code": "children_status_update",
+        "status": False,
+        "children": []
+    }
+
+    try:
+        # Get parent ID
+        parent_id = get_user_id(username)
+        if not parent_id:
+            response["message"] = f"Parent '{username}' not found"
+        else:
+            # Get children IDs
+            children_ids = get_children_ids_for_parent(parent_id)
+
+            children_status = []
+            for child_id in children_ids:
+                child_username = get_username_for_child_id(child_id)
+                is_connected = child_id in connected_children
+
+                # Build the status object
+                child_status = {
+                    "username": child_username,
+                    "connected": is_connected
+                }
+
+                if full_update:
+                    # Add more detailed info
+                    if is_connected:
+                        # Calculate current session time
+                        current_session = (time.time() - connected_children[child_id]["connected_time"]) / 60  # minutes
+                        total_time = connected_children[child_id]["used_time"] + current_session
+                    else:
+                        total_time = get_accumulated_time_from_db(child_id)
+
+                    time_limit = get_time_limit_for_child(child_id)
+
+                    child_status.update({
+                        "used_time": total_time,
+                        "time_limit": time_limit,
+                        "apps_blocked": len(get_blocked_apps_for_child(child_id)),
+                        "domains_blocked": len(get_blocked_domains_for_child(child_id))
+                    })
+
+                children_status.append(child_status)
+
+            response["status"] = True
+            response["children"] = children_status
+
+    except Exception as e:
+        print(f"Error in get_children_status: {e}")
+        response["message"] = f"Error: {str(e)}"
+
+    data = pickle.dumps(response)
+    data = AESenc(data)
+    send_with_size(sock, data)
+
+
+def handle_req(request_dict, sock):
+    print("at handle req")
+    request = request_dict['code']
+    print(request)
+
+    if request == 'login':
+        return login(request_dict, sock)
+
+    elif request == 'signup':
+        status = signup(request_dict, sock)
+        confirm_msg(request, status, sock)
+        return None
+
+    elif request == 'get_parents':
+        get_parents(sock)
+        return None
+
+    elif request == 'get_children_list':
+        get_children(request_dict, sock)
+        return None
+
+    elif request == 'get_children_status':
+        get_children_status(request_dict, sock)
+        return None
+
+    elif request == 'link_parent':
+        status = link_parent(request_dict, sock)
+        confirm_msg(request, status, sock)
+        return None
+
+    elif request == 'block_app':
+        status = block_app(request_dict, sock)
+        confirm_msg(request, status, sock)
+        return None
+
+    elif request == 'unblock_app':
+        status = unblock_app(request_dict, sock)
+        confirm_msg(request, status, sock)
+        return None
+
+    elif request == 'get_app_list':
+        get_app_list(request_dict, sock)
+        return None
+
+    elif request == 'block_domain':
+        status = block_domain(request_dict, sock)
+        confirm_msg(request, status, sock)
+        return None
+
+    elif request == 'unblock_domain':
+        status = unblock_domain(request_dict, sock)
+        confirm_msg(request, status, sock)
+        return None
+
+    elif request == 'get_domains_list':
+        get_domains_list(request_dict, sock)
+        return None
+
+    elif request == 'set_time_limit':
+        status = set_time_limit(request_dict, sock)
+        confirm_msg(request, status, sock)
+        return None
+
+    elif request == 'exit':
+        return 1
+
+
+def confirm_msg(code, is_confirmed, sock):
+    """Send a confirmation message back to the client"""
+    return_dict = {
+        "code": code,
+        "status": is_confirmed,
+    }
+    print(f"Sending confirmation - code: {code}, status: {is_confirmed}")
+    data = pickle.dumps(return_dict)
+    data = AESenc(data)
+    send_with_size(sock, data)
+    return
+
+
+def generate_random_key(length):
+    """Generate a random key of specified length"""
+    return secrets.token_bytes(length)
+
+
+def RSA(sock):
+    """Perform RSA key exchange with client"""
+    global key
+    public_key1 = int.from_bytes(generate_random_key(16), byteorder='big')
+    send_with_size(sock, str(public_key1).encode())
+    public_key2 = int(recv_by_size(sock, return_type='byte').decode())
+    print(f"Received key from client")
+
+    secret_key = int.from_bytes(generate_random_key(16), byteorder='big')
+    print(f"Generated secret key")
+
+    p = pow(public_key2, secret_key, public_key1)
+    send_with_size(sock, str(p).encode())
+
+    b = int(recv_by_size(sock, return_type='byte').decode())
+    a = pow(b, secret_key, public_key1)
+    key = int_to_bytes(a)
+    print(f"Completed key exchange, encryption key established")
+
+
+def int_to_bytes(x: int, length: int = None, byteorder: str = 'big') -> bytes:
+    """Convert integer to bytes"""
+    if length is None:
+        length = (x.bit_length() + 7) // 8
+    return x.to_bytes(length, byteorder)
+
+
+def check_client_connections():
+    """Periodic task to check for stale connections and update used time"""
+    while True:
+        try:
+            current_time = time.time()
+
+            # Check for disconnected children
+            disconnected_children = []
+            for child_id, data in connected_children.items():
+                # If we haven't received a message in 5 minutes, consider disconnected
+                if "last_activity" in data and current_time - data.get("last_activity", 0) > 300:
+                    disconnected_children.append(child_id)
+
+            # Process any disconnected children
+            for child_id in disconnected_children:
+                unregister_child(child_id)
+
+            # Update used time for all connected children
+            for child_id, data in connected_children.items():
+                connected_time = data["connected_time"]
+                session_duration = (current_time - connected_time) / 60  # in minutes
+
+                # Update the database every 5 minutes to avoid excessive writes
+                if "last_update" not in data or current_time - data.get("last_update", 0) > 300:
+                    total_time = data["used_time"] + session_duration
+                    update_accumulated_time_in_db(child_id, total_time)
+                    connected_children[child_id]["last_update"] = current_time
+                    print(f"Updated used time for child {child_id}: {total_time:.1f} minutes")
+
+            # Sleep for 1 minute before next check
+            time.sleep(60)
+
+        except Exception as e:
+            print(f"Error in check_client_connections: {e}")
+            time.sleep(30)  # Wait before retry
+
+
+def handle_client(sock, t, addr):
+    global key
+    RSA(sock)
+
+    # Variables to track client identity
+    client_id = None
+    client_type = None  # "parent" or "child"
+
+    while True:
+        try:
+            client_msg_encrypted = recv_by_size(sock, return_type='byte')  # Receive encrypted message from client
+            client_msg = AESdec(client_msg_encrypted)  # Decrypt the message
+            client_msg = pickle.loads(client_msg)  # load the pickle file to dict
+
+            # Process the message
+            result = handle_req(client_msg, sock)
+
+            # Check if it's a login request to store user identity
+            if client_msg['code'] == 'login' and result == "success":
+                username = client_msg['user']
+                # Get user details
+                user_id = get_user_id(username)
+                role = get_user_role(username)
+
+                client_id = user_id
+                client_type = "parent" if role == "Parent" else "child"
+                print(f"Client identified as {client_type} with ID {client_id}")
+
+            # Check if client wants to exit
+            if result == 1:
+                break
+        except Exception as e:
+            print(f"Error handling client messages: {e}")
+            break
+
+    # Clean up connection based on client type
+    if client_type == "child" and client_id is not None:
+        unregister_child(client_id)
+    elif client_type == "parent" and client_id is not None:
+        unregister_parent(client_id)
+
+    close_client(sock, t)
+
+
+def AESenc(data, k=None):
+    if k is None:
+        k = key
+    iv = get_random_bytes(AES.block_size)  # Generate a random IV
+    cipher = AES.new(k, AES.MODE_CBC, iv=iv)
+    ciphertext = cipher.encrypt(pad(data, AES.block_size))
+    return iv + ciphertext  # Prepend IV to the ciphertext for later use in decryption
+
+
+def AESdec(data, k=None):
+    if k is None:
+        k = key
+    iv = data[:AES.block_size]  # Extract IV from the beginning of the ciphertext
+    cipher = AES.new(k, AES.MODE_CBC, iv=iv)
+    decrypted = unpad(cipher.decrypt(data[AES.block_size:]), AES.block_size)
+    return decrypted
+
+
+def close_client(sock, t):
+    print(f"client number {t} has disconnected")
+    sock.close()
+    if sock in socks:
+        socks.remove(sock)
+
+
+def register_activity(child_id, activity_type, details=None):
+    """Log an activity for a child"""
+    try:
+        conn = sqlite3.connect('userData.db')
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            INSERT INTO activity_log (child_id, activity_type, details)
+            VALUES (?, ?, ?)
+        """, (child_id, activity_type, details))
+
+        conn.commit()
+        conn.close()
+
+        # Notify parents about the activity
+        child_username = get_username_for_child_id(child_id)
+        notification_text = f"{child_username}: {activity_type}"
+        if details:
+            notification_text += f" - {details}"
+
+        # Get parent IDs for this child
+        parent_ids = get_parent_ids_for_child(child_id)
+
+        # Prepare notification
+        notification = {
+            "code": "notification",
+            "content": notification_text
+        }
+
+        # Send to each connected parent
+        for parent_id in parent_ids:
+            if parent_id in connected_parents:
+                try:
+                    data = pickle.dumps(notification)
+                    data = AESenc(data)
+                    send_with_size(connected_parents[parent_id]["sock"], data)
+                except Exception as e:
+                    print(f"Failed to notify parent {parent_id}: {e}")
+
+        return True
+    except Exception as e:
+        print(f"Error logging activity: {e}")
+        return False
+
+
+def get_activity_logs(child_id, limit=20):
+    """Get recent activity logs for a child"""
+    try:
+        conn = sqlite3.connect('userData.db')
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT activity_type, details, timestamp
+            FROM activity_log 
+            WHERE child_id = ?
+            ORDER BY timestamp DESC
+            LIMIT ?
+        """, (child_id, limit))
+
+        logs = cursor.fetchall()
+        conn.close()
+
+        # Format logs for easy consumption
+        formatted_logs = []
+        for log in logs:
+            activity_type, details, timestamp = log
+            formatted_logs.append({
+                "type": activity_type,
+                "details": details,
+                "timestamp": timestamp
+            })
+
+        return formatted_logs
+    except Exception as e:
+        print(f"Error getting activity logs: {e}")
+        return []
+
+
+def check_time_limits():
+    """Check time limits for all connected children and enforce if needed"""
+    for child_id, data in list(connected_children.items()):  # Use list to avoid modification during iteration
+        try:
+            # Calculate current session time
+            current_time = time.time()
+            connected_time = data["connected_time"]
+            session_duration = (current_time - connected_time) / 60  # in minutes
+            total_time = data["used_time"] + session_duration
+
+            # Get time limit
+            time_limit = get_time_limit_for_child(child_id)
+
+            # Check if limit is exceeded
+            if total_time >= time_limit:
+                child_username = get_username_for_child_id(child_id)
+                print(f"Time limit reached for child {child_username}")
+
+                # Log the activity
+                register_activity(child_id, "time_limit_reached",
+                                  f"Used: {total_time:.1f} minutes, Limit: {time_limit} minutes")
+
+                # Notify the child
+                if "sock" in data:
+                    try:
+                        notification = {
+                            "code": "time_limit_reached",
+                            "message": "Your screen time limit has been reached."
+                        }
+
+                        notif_data = pickle.dumps(notification)
+                        notif_data = AESenc(notif_data)
+                        send_with_size(data["sock"], notif_data)
+                    except Exception as e:
+                        print(f"Error notifying child {child_id}: {e}")
+        except Exception as e:
+            print(f"Error checking time limit for child {child_id}: {e}")
+
+
+def status_update_manager():
+    """Thread that sends periodic updates to connected parent clients and checks time limits"""
+    update_interval = 30  # seconds between updates
+    last_time_check = 0
+
+    while True:
+        try:
+            current_time = time.time()
+
+            # Check time limits every minute
+            if current_time - last_time_check >= 60:
+                check_time_limits()
+                last_time_check = current_time
+
+            # Get all parent sockets that need updates
+            parents_to_update = get_connected_parents()
+
+            # Process each parent client
+            for parent_id, sock in parents_to_update.items():
+                try:
+                    # Generate status update for this parent
+                    children_status = generate_children_status_for_parent(parent_id)
+
+                    # Send the update
+                    response = {
+                        "code": "children_status_update",
+                        "status": True,
+                        "children": children_status
+                    }
+
+                    data = pickle.dumps(response)
+                    data = AESenc(data)
+                    send_with_size(sock, data)
+                except Exception as e:
+                    print(f"Error updating parent {parent_id}: {e}")
+
+            # Sleep for the update interval
+            time.sleep(update_interval)
+        except Exception as e:
+            print(f"Error in status update manager: {e}")
+            time.sleep(5)  # Brief pause before retry if there's an error
+
+
+def main(port):
+    """
+    main server loop
+    1. accept tcp connection
+    2. create thread for each connected new client
+    3. start status update manager for real-time updates
+    4. start connection monitor thread
+    """
+    # Start the status update manager thread
+    update_thread = threading.Thread(target=status_update_manager, daemon=True)
+    update_thread.start()
+    print("Status update manager started")
+
+    # Start the connection monitor thread
+    monitor_thread = threading.Thread(target=check_client_connections, daemon=True)
+    monitor_thread.start()
+    print("Connection monitor started")
+
+    # Create server socket
+    srv_sock = socket.socket()
+    srv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # Allow address reuse
+    srv_sock.bind(('0.0.0.0', port))
+    srv_sock.listen(20)
+
+    print(f"Server started on port {port}")
+
+    i = 1
+    while True:
+        try:
+            print('\nMain thread: waiting for connections...')
+            cli_sock, addr = srv_sock.accept()
+            print(f"Client {i} connected from {addr}")
+            t = threading.Thread(target=handle_client, args=(cli_sock, str(i), addr))
+            t.start()
+            i += 1
+
+            # Safety exit condition (for testing)
+            if i > 100000000:  # for tests change it to a lower number
+                print('\nMain thread: going down for maintenance')
+                break
+
+        except KeyboardInterrupt:
+            print("\nServer shutdown requested...")
+            break
+        except Exception as e:
+            print(f"Error accepting connections: {e}")
+            time.sleep(1)  # Brief pause before retry
+
+    print("Server shutting down...")
+    try:
+        srv_sock.close()
+    except:
+        pass
+
+
+# Additional helper for database setup
+def ensure_database_setup():
+    """Check database exists and has all required tables; create them if needed"""
+    try:
+        if not os.path.exists('userData.db'):
+            print("Creating new database...")
+
+        conn = sqlite3.connect('userData.db')
+        cursor = conn.cursor()
+
+        # Create users table if not exists
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password_hash BLOB NOT NULL,
+                salt BLOB NOT NULL,
+                email TEXT UNIQUE NOT NULL,
+                role TEXT NOT NULL,
+                account_created TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_login TIMESTAMP,
+                is_active INTEGER DEFAULT 1,
+                preferences TEXT,
+                limit_settings TEXT
+            )
+        """)
+
+        # Create relationships table if not exists
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS relationships (
+                relationship_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                parent_id INTEGER NOT NULL,
+                child_id INTEGER NOT NULL,
+                FOREIGN KEY (parent_id) REFERENCES users(user_id),
+                FOREIGN KEY (child_id) REFERENCES users(user_id),
+                UNIQUE(parent_id, child_id)
+            )
+        """)
+
+        # Create blocked_apps table if not exists
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS blocked_apps (
+                blocked_apps_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                child_id INTEGER NOT NULL,
+                app_names TEXT,  -- JSON array of app names
+                date_added TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (child_id) REFERENCES users(user_id)
+            )
+        """)
+
+        # Create blocked_websites table if not exists
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS blocked_websites (
+                blocked_websites_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                child_id INTEGER NOT NULL,
+                domains TEXT,  -- JSON array of domains
+                date_added TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (child_id) REFERENCES users(user_id)
+            )
+        """)
+
+        # Create time_limits table if not exists
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS time_limits (
+                time_limit_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                child_id INTEGER NOT NULL,
+                time_limit INTEGER DEFAULT 1440,  -- Default to 24 hours (1440 minutes)
+                used_time REAL DEFAULT 0,
+                date_added TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (child_id) REFERENCES users(user_id)
+            )
+        """)
+
+        # Create activity_log table if not exists
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS activity_log (
+                log_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                child_id INTEGER NOT NULL,
+                activity_type TEXT NOT NULL,  -- e.g., 'app_blocked', 'website_blocked', 'time_limit_reached'
+                details TEXT,  -- Additional details about the activity
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (child_id) REFERENCES users(user_id)
+            )
+        """)
+
+        conn.commit()
+        print("Database setup completed successfully")
+        return True
+
+    except sqlite3.Error as e:
+        print(f"Database setup error: {e}")
+        return False
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
+
+if __name__ == '__main__':
+    # Ensure database is set up properly
+    print("Starting server on port 6108...")
+    # Start the server
+    main(6112)
